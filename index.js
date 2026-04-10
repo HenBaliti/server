@@ -18,12 +18,19 @@ const WAITING_TIMEOUT_MS = 60_000; // אחרי דקה נעדכן "still waiting"
 const RECONNECT_GRACE_MS = 20_000; // חלון זמן לחיבור מחדש
 const QUEUE_TICK_MS = 1_000;
 
+// Subscription priority multipliers
+const SUBSCRIPTION_PRIORITY = {
+  free: 1,
+  premium: 2,
+  vip: 5,
+};
+
 /**
  * ====== STATE (POC: in-memory) ======
  */
-const waitingQueue = []; // [{ socketId, enqueuedAt, userProfile, filterPreferences }]
+const waitingQueue = []; // [{ socketId, enqueuedAt, subscription, filters }]
 const partnerOf = new Map(); // socketId -> partnerSocketId
-const socketProfiles = new Map(); // socketId -> userProfile
+const socketProfiles = new Map(); // socketId -> { subscription, filters }
 
 // reconnect
 const socketIdByClientId = new Map(); // clientId -> socketId
@@ -49,11 +56,23 @@ function pair(a, b) {
   partnerOf.set(b, a);
 
   // Get profiles for both users
-  const profileA = socketProfiles.get(a) || { gender: 'male', country: 'Unknown', subscriptionType: 'free', showLocation: true, showGender: true };
-  const profileB = socketProfiles.get(b) || { gender: 'female', country: 'Unknown', subscriptionType: 'free', showLocation: true, showGender: true };
+  const profileA = socketProfiles.get(a) || { subscription: 'free', filters: {} };
+  const profileB = socketProfiles.get(b) || { subscription: 'free', filters: {} };
 
-  io.to(a).emit("matched", { role: "caller", partnerInfo: profileB });
-  io.to(b).emit("matched", { role: "callee", partnerInfo: profileA });
+  io.to(a).emit("matched", { 
+    role: "caller", 
+    partnerInfo: { 
+      subscription: profileB.subscription,
+      isPremium: profileB.subscription !== 'free'
+    } 
+  });
+  io.to(b).emit("matched", { 
+    role: "callee", 
+    partnerInfo: { 
+      subscription: profileA.subscription,
+      isPremium: profileA.subscription !== 'free'
+    } 
+  });
 }
 
 function unpair(id) {
@@ -69,8 +88,12 @@ function matchOrEnqueue(socket, userProfile, filterPreferences) {
   // אם כבר בזוג - לא לעשות כלום
   if (partnerOf.has(socket.id)) return;
 
-  // Store user profile
-  socketProfiles.set(socket.id, userProfile);
+  // Extract subscription info from the new format
+  const subscription = userProfile?.subscription || filterPreferences?.subscription || 'free';
+  const filters = filterPreferences?.filters || filterPreferences || {};
+  
+  // Store user profile with subscription info
+  socketProfiles.set(socket.id, { subscription, filters });
 
   // אם כבר בתור - רק לעדכן סטטוס
   if (waitingQueue.some((x) => x.socketId === socket.id)) {
@@ -81,15 +104,74 @@ function matchOrEnqueue(socket, userProfile, filterPreferences) {
   // נקה את עצמך מכל מצב קודם
   safeRemoveFromQueue(socket.id);
 
-  // נסה למצוא מישהו אחר בתור (ראש התור)
-  const other = waitingQueue.shift();
-  if (other && other.socketId !== socket.id) {
-    pair(socket.id, other.socketId);
+  // Find best match based on subscription priority and filters
+  const match = findBestMatch(socket.id, subscription, filters);
+  
+  if (match) {
+    const idx = waitingQueue.findIndex(x => x.socketId === match.socketId);
+    if (idx !== -1) waitingQueue.splice(idx, 1);
+    pair(socket.id, match.socketId);
   } else {
-    // אין מישהו מתאים - הכנס לתור
-    waitingQueue.push({ socketId: socket.id, enqueuedAt: now(), userProfile, filterPreferences });
+    // No match found - add to queue with priority based on subscription
+    const priority = SUBSCRIPTION_PRIORITY[subscription] || 1;
+    waitingQueue.push({ 
+      socketId: socket.id, 
+      enqueuedAt: now(), 
+      subscription,
+      filters,
+      priority
+    });
+    
+    // Sort queue by priority (higher priority first) then by time
+    waitingQueue.sort((a, b) => {
+      if (b.priority !== a.priority) return b.priority - a.priority;
+      return a.enqueuedAt - b.enqueuedAt;
+    });
+    
     socket.emit("waiting");
   }
+}
+
+/**
+ * Find the best matching user from the queue
+ * Premium users get priority matching with filter support
+ */
+function findBestMatch(socketId, subscription, filters) {
+  if (waitingQueue.length === 0) return null;
+  
+  const isPremium = subscription === 'premium' || subscription === 'vip';
+  
+  // For free users, just return the first available person
+  if (!isPremium || !filters || Object.keys(filters).length === 0) {
+    const first = waitingQueue.find(x => x.socketId !== socketId);
+    return first || null;
+  }
+  
+  // For premium users, try to find a match based on filters
+  // First pass: exact filter match
+  for (const candidate of waitingQueue) {
+    if (candidate.socketId === socketId) continue;
+    
+    const candidateProfile = socketProfiles.get(candidate.socketId) || {};
+    const candidateFilters = candidateProfile.filters || {};
+    
+    // Check gender filter
+    if (filters.gender && filters.gender !== 'anyone') {
+      // In a real app, you'd match against the user's actual gender
+      // For POC, we just check if filters are compatible
+    }
+    
+    // Check region filter
+    if (filters.region && filters.region !== 'global') {
+      // In a real app, you'd check user's actual region
+    }
+    
+    // For now, accept any match for premium users
+    return candidate;
+  }
+  
+  // If no filter match, return first available
+  return waitingQueue.find(x => x.socketId !== socketId) || null;
 }
 
 // שליחת הודעת צ'אט לצד השני (רק אם יש partner)
@@ -117,12 +199,16 @@ setInterval(() => {
     if (!sock) return;
 
     const waitedMs = t - item.enqueuedAt;
-    const etaSec = Math.max(3, Math.round((index + 1) * 3)); // ETA פיקטיבי ל-POC
+    // Premium users get faster ETA
+    const priorityMultiplier = item.priority || 1;
+    const baseEta = Math.max(3, Math.round((index + 1) * 3));
+    const etaSec = Math.max(1, Math.round(baseEta / priorityMultiplier));
 
     sock.emit("queue-status", {
       position: index + 1,
       etaSec,
       waitedSec: Math.floor(waitedMs / 1000),
+      isPriority: priorityMultiplier > 1,
     });
 
     if (
@@ -166,7 +252,9 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("find", ({ userProfile, filterPreferences }) => {
+  socket.on("find", (data) => {
+    const userProfile = data?.userProfile || {};
+    const filterPreferences = data?.filterPreferences || {};
     matchOrEnqueue(socket, userProfile, filterPreferences);
   });
 
