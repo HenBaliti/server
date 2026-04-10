@@ -21,8 +21,9 @@ const QUEUE_TICK_MS = 1_000;
 /**
  * ====== STATE (POC: in-memory) ======
  */
-const waitingQueue = []; // [{ socketId, enqueuedAt }]
+const waitingQueue = []; // [{ socketId, enqueuedAt, userProfile, filterPreferences }]
 const partnerOf = new Map(); // socketId -> partnerSocketId
+const socketProfiles = new Map(); // socketId -> userProfile
 
 // reconnect
 const socketIdByClientId = new Map(); // clientId -> socketId
@@ -47,8 +48,12 @@ function pair(a, b) {
   partnerOf.set(a, b);
   partnerOf.set(b, a);
 
-  io.to(a).emit("matched", { role: "caller" });
-  io.to(b).emit("matched", { role: "callee" });
+  // Get profiles for both users
+  const profileA = socketProfiles.get(a) || { gender: 'male', country: 'Unknown', subscriptionType: 'free', showLocation: true, showGender: true };
+  const profileB = socketProfiles.get(b) || { gender: 'female', country: 'Unknown', subscriptionType: 'free', showLocation: true, showGender: true };
+
+  io.to(a).emit("matched", { role: "caller", partnerInfo: profileB });
+  io.to(b).emit("matched", { role: "callee", partnerInfo: profileA });
 }
 
 function unpair(id) {
@@ -60,9 +65,12 @@ function unpair(id) {
   return p;
 }
 
-function matchOrEnqueue(socket) {
+function matchOrEnqueue(socket, userProfile, filterPreferences) {
   // אם כבר בזוג - לא לעשות כלום
   if (partnerOf.has(socket.id)) return;
+
+  // Store user profile
+  socketProfiles.set(socket.id, userProfile);
 
   // אם כבר בתור - רק לעדכן סטטוס
   if (waitingQueue.some((x) => x.socketId === socket.id)) {
@@ -79,7 +87,7 @@ function matchOrEnqueue(socket) {
     pair(socket.id, other.socketId);
   } else {
     // אין מישהו מתאים - הכנס לתור
-    waitingQueue.push({ socketId: socket.id, enqueuedAt: now() });
+    waitingQueue.push({ socketId: socket.id, enqueuedAt: now(), userProfile, filterPreferences });
     socket.emit("waiting");
   }
 }
@@ -158,8 +166,8 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("find", () => {
-    matchOrEnqueue(socket);
+  socket.on("find", ({ userProfile, filterPreferences }) => {
+    matchOrEnqueue(socket, userProfile, filterPreferences);
   });
 
   socket.on("next", () => {
@@ -205,6 +213,9 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     // אם היה בתור - להסיר
     safeRemoveFromQueue(socket.id);
+
+    // Remove profile
+    socketProfiles.delete(socket.id);
 
     // אם היה בזוג - להודיע לצד השני
     const partner = unpair(socket.id);
